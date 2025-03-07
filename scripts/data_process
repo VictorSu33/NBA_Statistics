@@ -1,0 +1,159 @@
+import mysql.connector
+from mysql.connector import Error
+
+def process_games(host, database, user, password):
+    """
+    Simple processing on games to turn W/L into 1/0 and game_date column to DATE type
+
+    Args:
+        host (str): MySQL server host name
+        database (str): MySQL database
+        user (str): MySQL username
+        password (str): MySQL password
+
+    Returns:
+        None
+    """
+
+    original_table = 'games_raw'
+    new_table = 'games_processed'
+
+    try:
+        connection = mysql.connector.connect(
+            host=host,
+            database=database,
+            user=user,
+            password=password
+        )
+        if connection.is_connected():
+            cursor = connection.cursor()
+
+            cursor.execute(f"CREATE TABLE IF NOT EXISTS {new_table} LIKE {original_table};")
+            print(f"Table '{new_table}' created with the same structure as '{original_table}'.")
+
+            cursor.execute(f"INSERT INTO {new_table} SELECT * FROM {original_table};")
+            print(f"Data copied from '{original_table}' to '{new_table}'.")
+
+            cursor.execute(f"ALTER TABLE {new_table} ADD COLUMN GAME_DATE_NEW DATE;")
+            cursor.execute(f"UPDATE {new_table} SET GAME_DATE_NEW = STR_TO_DATE(GAME_DATE, '%Y-%m-%d');")
+            cursor.execute(f"ALTER TABLE {new_table} DROP COLUMN GAME_DATE;")
+            cursor.execute(f"ALTER TABLE {new_table} RENAME COLUMN GAME_DATE_NEW TO GAME_DATE;")
+            print("Finished converting column")
+            
+            cursor.execute("UPDATE games_processed SET WL = CASE WHEN WL = 'W' THEN 1 \
+                           WHEN WL = 'L' THEN 0 END;")
+            print("Mapped W/L to 1/0")
+
+            connection.commit()
+            print("Changes committed successfully.")
+
+    except Error as e:
+        print(f"Error: {e}")
+
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+            print("MySQL connection is closed.")
+
+def create_log_reg_data(host, database, user, password ):
+    """
+    Create table to be used for logistic regression.
+    For each game played, the ratio of every season stat between participants is recorded.
+    Each game is recorded twice, once as a win and once as a loss, the corresponding rations are inverses.
+
+    Args:
+        host (str): MySQL server host name
+        database (str): MySQL database
+        user (str): MySQL username
+        password (str): MySQL password
+
+    Returns:
+        None
+    """
+
+    try:
+        connection = mysql.connector.connect(
+            host=host,
+            database=database,
+            user=user,
+            password=password
+        )
+        if connection.is_connected():
+            cursor = connection.cursor()
+
+            cursor.execute(f"SELECT SEASON_ID, MATCHUP, WL FROM games_processed;")
+            
+            rows = cursor.fetchall()
+            
+            cursor.execute(f"CREATE TABLE IF NOT EXISTS log_reg_data (WL INT, TEAM1 VARCHAR(255), TEAM2 VARCHAR(255), \
+                           YEAR VARCHAR(255),FG_PCT_RATIO FLOAT, FG3_PCT_RATIO FLOAT, FT_PCT_RATIO FLOAT, OREB_RATIO FLOAT, REB_RATIO FLOAT, \
+                           AST_RATIO FLOAT, PF_RATIO FLOAT, STL_RATIO FLOAT, TOV_RATIO FLOAT, BLK_RATIO FLOAT, PTS_RATIO FLOAT);")
+            
+
+            for row in rows:
+                season, matchup, wl = row
+
+                team_1 = matchup[:3]
+                team_2 = matchup[-3:]
+
+                if team_1.lower() == "noh":
+                    team_1 = "nop"
+
+                if team_2.lower() == "noh":
+                    team_2 = "nop"
+                
+                year = season[1:] + '-' + str(int(season[-2:])+1)
+
+                team_1_query = f"""SELECT FG_PCT, FG3_PCT, FT_PCT, OREB, REB, AST, PF, STL, TOV, BLK, PTS 
+                FROM {team_1}_stats_raw 
+                WHERE YEAR = %s"""
+                team_2_query = f"""SELECT FG_PCT, FG3_PCT, FT_PCT, OREB, REB, AST, PF, STL, TOV, BLK, PTS 
+                FROM {team_2}_stats_raw 
+                WHERE YEAR = %s"""
+
+                cursor.execute(team_1_query, (year,))
+                team_1_stats = cursor.fetchall()[0]
+                cursor.execute(team_2_query, (year,))
+                team_2_stats = cursor.fetchall()[0]
+                
+                ratio_stats = tuple(a / b for a, b in zip(team_1_stats, team_2_stats))
+     
+                new_row = (int(wl), team_1, team_2, year) + ratio_stats
+
+                placeholders = ', '.join(['%s' for _ in range(len(new_row))])
+                query = f'INSERT INTO log_reg_data VALUES ({placeholders})'
+
+                cursor.execute(query, new_row)
+            connection.commit()
+            print("table created succesfully")
+
+    except Error as e:
+        print(f"Error: {e}")
+
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+            print("MySQL connection is closed.")
+
+def rolling_mean_data():
+    '''
+    create data for rolling period averages instead of absolute averages, add data for days rest
+    '''
+    pass
+
+if __name__ == "__main__":
+    import json
+    import os
+
+    with open('config.json') as f:
+        config = json.load(f)
+
+    host = os.getenv('host', config['database']['host'])
+    database = os.getenv('db', config['database']['database'])
+    user = os.getenv('user', config['database']['user'])
+    password = os.getenv('password', config['database']['password'])
+
+    process_games(host,database,user,password)
+    create_log_reg_data(host, database, user, password)
